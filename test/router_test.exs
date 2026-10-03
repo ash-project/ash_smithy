@@ -213,6 +213,11 @@ defmodule AshSmithy.RouterTest do
       assert ids("estimateGt=5&estimateLt=11") == [c]
     end
 
+    test "string function filters", %{a: a, b: b} do
+      assert ids("subjectStartsWith=Al") == [a]
+      assert ids("subjectEndsWith=ta") == [b]
+    end
+
     test "contains and is nil filters", %{a: a, b: b, c: c} do
       assert ids("subjectContains=mm") == [c]
       assert ids("bodyIsNil=false") == [b]

@@ -3,28 +3,49 @@ defmodule AshSmithy.Plan.Query do
   # Plans the query parameters derived from the resource rather than the action:
   # filters and sorts for operations that return lists, and includes for operations that
   # return records.
+  #
+  # Which fields can be filtered and sorted on, and with which operators and functions, comes
+  # from the resource's `Ash.Info.Manifest`, which accounts for what the data layer supports.
 
   alias AshSmithy.Naming
   alias AshSmithy.Plan.Binding
   alias AshSmithy.Type.Member
+  alias Ash.Info.Manifest
 
   @comparable ["Long", "Integer", "Double", "BigDecimal", "BigInteger", "Timestamp"]
 
-  def bindings(resource, operation, action, operation_name, output, pagination) do
+  # Manifest operator => filter input operator, query parameter suffix, description
+  @ranges [
+    {:>, :greater_than, "Gt", "greater than"},
+    {:>=, :greater_than_or_equal, "Gte", "greater than or equal to"},
+    {:<, :less_than, "Lt", "less than"},
+    {:<=, :less_than_or_equal, "Lte", "less than or equal to"}
+  ]
+
+  # Manifest function => query parameter suffix, description
+  @string_functions [
+    {:contains, "Contains", "contains"},
+    {:string_starts_with, "StartsWith", "starts with"},
+    {:string_ends_with, "EndsWith", "ends with"}
+  ]
+
+  def bindings(manifest, operation, action, operation_name, output, pagination) do
     list? = output == :records and action.type == :read
 
     Enum.concat([
-      if(list?, do: filter_bindings(resource, operation), else: []),
-      if(list?, do: sort_bindings(resource, operation, operation_name, pagination), else: []),
-      include_bindings(resource, output)
+      if(list?, do: filter_bindings(manifest, operation), else: []),
+      if(list?, do: sort_bindings(manifest, operation, operation_name, pagination), else: []),
+      include_bindings(manifest, output)
     ])
   end
 
   ## Filters
 
-  defp filter_bindings(_resource, %{filter: false}), do: []
+  defp filter_bindings(_manifest, %{filter: false}), do: []
 
-  defp filter_bindings(resource, operation) do
+  defp filter_bindings(manifest, operation) do
+    resource = manifest.resource.module
+
     plural =
       resource
       |> AshSmithy.Resource.Info.plural_name()
@@ -35,56 +56,53 @@ defmodule AshSmithy.Plan.Query do
 
     resource
     |> structure_members()
-    |> select_fields(resource, operation, :filter, &filterable?(resource, &1))
+    |> select_fields(resource, operation, :filter, &filterable?(manifest, &1))
     |> Enum.flat_map(fn member ->
-      field = Ash.Resource.Info.field(resource, member.name)
+      field = Manifest.Resource.get_field(manifest.resource, member.name)
+      operators = MapSet.new(field.filter_operators || [], & &1.name)
+      functions = MapSet.new(field.filter_functions || [], & &1.name)
       descriptor = filter_descriptor(member.descriptor)
-      operators? = Map.get(field, :filterable?) != :simple_equality
       name = member.member
 
       Enum.concat([
-        [
-          filter(
-            member,
-            :in,
-            name,
-            values_descriptor(resource, member, descriptor),
-            "Only return #{plural} whose `#{name}` is one of the given values."
-          )
-        ],
-        if operators? and comparable?(descriptor) do
-          for {op, suffix, description} <- [
-                {:greater_than, "Gt", "greater than"},
-                {:greater_than_or_equal, "Gte", "greater than or equal to"},
-                {:less_than, "Lt", "less than"},
-                {:less_than_or_equal, "Lte", "less than or equal to"}
-              ] do
-            filter(
-              member,
-              op,
-              name <> suffix,
-              descriptor,
-              "Only return #{plural} whose `#{name}` is #{description} the given value."
-            )
-          end
-        else
-          []
-        end,
-        if operators? and Ash.Type.get_type(field.type) in [Ash.Type.String, Ash.Type.CiString] and
-             member.name not in identifiers do
+        if MapSet.member?(operators, :in) or MapSet.member?(operators, :==) do
           [
             filter(
               member,
-              :contains,
-              name <> "Contains",
-              descriptor,
-              "Only return #{plural} whose `#{name}` contains the given value."
+              :in,
+              name,
+              values_descriptor(resource, member, descriptor),
+              "Only return #{plural} whose `#{name}` is one of the given values."
             )
           ]
         else
           []
         end,
-        if operators? and not member.required? do
+        # Ash can compare any values, but ranges are only offered for numbers and timestamps
+        for {operator, op, suffix, description} <- @ranges,
+            comparable?(descriptor),
+            MapSet.member?(operators, operator) do
+          filter(
+            member,
+            op,
+            name <> suffix,
+            descriptor,
+            "Only return #{plural} whose `#{name}` is #{description} the given value."
+          )
+        end,
+        for {function, suffix, description} <- @string_functions,
+            match?({:simple, "String", _}, descriptor),
+            member.name not in identifiers,
+            MapSet.member?(functions, function) do
+          filter(
+            member,
+            function,
+            name <> suffix,
+            descriptor,
+            "Only return #{plural} whose `#{name}` #{description} the given value."
+          )
+        end,
+        if MapSet.member?(operators, :is_nil) and not member.required? do
           [
             filter(
               member,
@@ -130,25 +148,30 @@ defmodule AshSmithy.Plan.Query do
   defp comparable?({:simple, type, _}), do: type in @comparable
   defp comparable?(_), do: false
 
-  defp filterable?(resource, member) do
-    field = Ash.Resource.Info.field(resource, member.name)
+  defp filterable?(manifest, member) do
+    field = Manifest.Resource.get_field(manifest.resource, member.name)
 
-    scalar?(member.descriptor) and Map.get(field, :filterable?, true) != false and
-      expression?(field)
+    scalar?(member.descriptor) and field.filterable? == true and
+      field.filter_operators not in [nil, []] and
+      expression?(manifest.resource.module, field)
   end
 
   ## Sorting
 
-  defp sort_bindings(_resource, %{sort: false}, _operation_name, _pagination), do: []
+  defp sort_bindings(_manifest, %{sort: false}, _operation_name, _pagination), do: []
 
-  defp sort_bindings(resource, operation, operation_name, pagination) do
-    pagination_type = if pagination, do: pagination.type, else: :offset
+  defp sort_bindings(manifest, operation, operation_name, pagination) do
+    resource = manifest.resource.module
+    keyset? = match?(%{type: :keyset}, pagination)
 
     resource
     |> structure_members()
     |> select_fields(resource, operation, :sort, fn member ->
-      scalar?(member.descriptor) and
-        Ash.Resource.Info.sortable?(resource, member.name, pagination_type: pagination_type)
+      field = Manifest.Resource.get_field(manifest.resource, member.name)
+
+      # Keyset pagination can't sort by calculations
+      scalar?(member.descriptor) and field.sortable? == true and
+        not (keyset? and field.kind == :calculation)
     end)
     |> case do
       [] ->
@@ -196,8 +219,10 @@ defmodule AshSmithy.Plan.Query do
 
   ## Includes
 
-  defp include_bindings(resource, output) when output in [:record, :records] do
-    case AshSmithy.Resource.Info.relationships(resource) do
+  defp include_bindings(manifest, output) when output in [:record, :records] do
+    resource = manifest.resource.module
+
+    case AshSmithy.Resource.Info.smithy_relationships!(resource) do
       [] ->
         []
 
@@ -206,7 +231,7 @@ defmodule AshSmithy.Plan.Query do
 
         members =
           Enum.map(relationships, fn relationship ->
-            {AshSmithy.Resource.Info.member_name(resource, relationship.name), relationship.name}
+            {AshSmithy.Resource.Info.member_name(resource, relationship), relationship}
           end)
 
         [
@@ -229,15 +254,17 @@ defmodule AshSmithy.Plan.Query do
     end
   end
 
-  defp include_bindings(_resource, _output), do: []
+  defp include_bindings(_manifest, _output), do: []
 
   ## Helpers
 
   defp enum_name(member), do: member |> Macro.underscore() |> String.upcase()
 
+  # The fields of the resource's structure, without its relationships
   defp structure_members(resource) do
     {:structure, _, members} = AshSmithy.Type.resource_structure(resource)
-    Enum.reject(members, &Ash.Resource.Info.relationship(resource, &1.name))
+    relationships = AshSmithy.Resource.Info.smithy_relationships!(resource)
+    Enum.reject(members, &(&1.name in relationships))
   end
 
   defp select_fields(members, resource, operation, option, default?) do
@@ -266,11 +293,18 @@ defmodule AshSmithy.Plan.Query do
   defp scalar?({:enum, _, _}), do: true
   defp scalar?(_), do: false
 
-  # Calculations can only be filtered on if they can be expressed in the data layer.
-  defp expression?(%Ash.Resource.Calculation{calculation: {module, _}}) do
-    Code.ensure_compiled(module)
-    function_exported?(module, :expression, 2)
+  # Calculations can only be filtered on if they can be expressed in the data layer, which
+  # the manifest doesn't describe.
+  defp expression?(resource, %{kind: :calculation, name: name}) do
+    case Ash.Resource.Info.calculation(resource, name) do
+      %{calculation: {module, _}} ->
+        Code.ensure_compiled(module)
+        function_exported?(module, :expression, 2)
+
+      _ ->
+        true
+    end
   end
 
-  defp expression?(_), do: true
+  defp expression?(_resource, _field), do: true
 end

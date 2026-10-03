@@ -160,6 +160,9 @@ defmodule AshSmithy.ModelTest do
     assert members["insertedAtLt"]["traits"]["smithy.api#timestampFormat"] == "date-time"
     assert members["subjectContains"]["target"] == "smithy.api#String"
     assert members["bodyIsNil"]["target"] == "smithy.api#Boolean"
+    # string functions the data layer supports
+    assert members["subjectStartsWith"]["target"] == "smithy.api#String"
+    assert members["subjectEndsWith"]["target"] == "smithy.api#String"
 
     # constraints describe field values, not filter values
     refute Map.has_key?(members["subjectContains"]["traits"], "smithy.api#length")

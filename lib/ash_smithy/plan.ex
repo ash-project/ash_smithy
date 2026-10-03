@@ -147,7 +147,7 @@ defmodule AshSmithy.Plan do
       |> AshSmithy.Resource.Info.identifiers()
       |> Enum.map(fn name ->
         %{
-          attribute_member(resource, name)
+          attribute_member(resource, AshSmithy.Manifest.for_resource(resource), name)
           | member: AshSmithy.Resource.Info.identifier_name(resource, name)
         }
       end)
@@ -177,7 +177,8 @@ defmodule AshSmithy.Plan do
   end
 
   defp operation(domain, resource, operation, identifiers, properties) do
-    action = Ash.Resource.Info.action(resource, operation.action)
+    manifest = AshSmithy.Manifest.for_resource(resource)
+    action = AshSmithy.Manifest.action(resource, operation.action)
     name = operation_name(resource, operation)
     instance? = operation.kind in [:read, :update, :delete, :operation]
     readonly? = action.type == :read or (action.type == :action and operation.readonly?)
@@ -219,9 +220,9 @@ defmodule AshSmithy.Plan do
     input =
       Enum.concat([
         if(instance?, do: Enum.map(identifiers, &identifier_binding/1), else: []),
-        action_bindings(resource, action, name, operation, method, property_names),
+        action_bindings(resource, manifest, action, name, operation, method, property_names),
         pagination_bindings(pagination),
-        AshSmithy.Plan.Query.bindings(resource, operation, action, name, output, pagination)
+        AshSmithy.Plan.Query.bindings(manifest, operation, action, name, output, pagination)
       ])
 
     verify_unique_members!(resource, operation, name, input)
@@ -241,9 +242,10 @@ defmodule AshSmithy.Plan do
           %Member{
             name: :result,
             member: "result",
-            descriptor:
-              AshSmithy.Type.describe(action.returns, action.constraints, name <> "Result"),
-            required?: Map.get(action, :allow_nil?, true) == false
+            descriptor: AshSmithy.Type.describe(action.returns, name <> "Result", manifest),
+            # Result nullability isn't part of the manifest
+            required?:
+              Map.get(Ash.Resource.Info.action(resource, action.name), :allow_nil?, true) == false
           }
         end,
       read_action:
@@ -256,7 +258,7 @@ defmodule AshSmithy.Plan do
       description: operation.description || action.description,
       output: output,
       output_member: output_member(resource, output),
-      metadata: metadata(resource, action, name, output),
+      metadata: metadata(resource, manifest, action, name, output),
       pagination: pagination,
       readonly?: readonly?,
       idempotent?: operation.idempotent? and not readonly?,
@@ -381,11 +383,12 @@ defmodule AshSmithy.Plan do
   end
 
   # Action metadata is returned alongside the record(s) as a `metadata` structure.
-  defp metadata(_resource, _action, _name, output) when output not in [:record, :records, :empty],
-    do: nil
+  defp metadata(_resource, _manifest, _action, _name, output)
+       when output not in [:record, :records, :empty],
+       do: nil
 
-  defp metadata(resource, action, name, _output) do
-    case Map.get(action, :metadata, []) do
+  defp metadata(resource, manifest, action, name, _output) do
+    case action.metadata || [] do
       [] ->
         nil
 
@@ -398,8 +401,8 @@ defmodule AshSmithy.Plan do
              descriptor:
                AshSmithy.Type.describe(
                  metadata.type,
-                 metadata.constraints,
-                 name <> "Metadata" <> Naming.shape_name(metadata.name)
+                 name <> "Metadata" <> Naming.shape_name(metadata.name),
+                 manifest
                ),
              description: metadata.description,
              required?: metadata.allow_nil? == false
@@ -510,37 +513,46 @@ defmodule AshSmithy.Plan do
     }
   end
 
-  defp attribute_member(resource, name) do
-    attribute = Ash.Resource.Info.attribute(resource, name)
-    resource_name = AshSmithy.Resource.Info.name(resource)
+  # Attributes are described with the same shapes as the resource's structure, so that
+  # inputs bound to resource properties target the same shapes as the properties themselves.
+  defp attribute_member(resource, manifest, name) do
+    field = Ash.Info.Manifest.Resource.get_field(manifest.resource, name)
 
     descriptor =
       AshSmithy.Type.describe(
-        attribute.type,
-        attribute.constraints,
-        resource_name <> Naming.shape_name(attribute.name)
+        field.type,
+        AshSmithy.Resource.Info.name(resource) <> Naming.shape_name(name),
+        manifest
       )
 
     %Member{
-      name: attribute.name,
-      member: AshSmithy.Resource.Info.member_name(resource, attribute.name),
+      name: name,
+      member: AshSmithy.Resource.Info.member_name(resource, name),
       descriptor:
         if name in AshSmithy.Resource.Info.identifiers(resource) do
           AshSmithy.Type.identifier_descriptor(descriptor)
         else
           descriptor
         end,
-      description: attribute.description
+      description: field.description
     }
   end
 
-  defp action_bindings(resource, action, operation_name, operation, method, property_names) do
+  defp action_bindings(
+         resource,
+         manifest,
+         action,
+         operation_name,
+         operation,
+         method,
+         property_names
+       ) do
     body? = method not in ["GET", "DELETE", "HEAD"]
     query = MapSet.new(List.wrap(operation.query))
     headers = Map.new(operation.headers)
 
     action
-    |> action_members(resource, operation_name)
+    |> action_members(resource, manifest, operation_name)
     |> Enum.map(fn member ->
       {location, location_name} =
         cond do
@@ -570,68 +582,70 @@ defmodule AshSmithy.Plan do
     end)
   end
 
-  defp action_members(action, resource, operation_name) do
-    attributes =
-      action
-      |> Map.get(:accept, [])
-      |> List.wrap()
-      |> Enum.map(fn name ->
-        attribute = Ash.Resource.Info.attribute(resource, name)
+  # The manifest unifies accepted attributes and arguments into the action's inputs, with
+  # Ash's own semantics for whether each input is required.
+  defp action_members(action, resource, manifest, operation_name) do
+    Enum.map(action.inputs, fn input ->
+      attribute? =
+        match?(
+          %{kind: :attribute},
+          Ash.Info.Manifest.Resource.get_field(manifest.resource, input.name)
+        )
 
-        member = attribute_member(resource, name)
+      member =
+        if attribute? do
+          attribute_member(resource, manifest, input.name)
+        else
+          %Member{
+            name: input.name,
+            member: AshSmithy.Resource.Info.member_name(resource, input.name),
+            descriptor:
+              AshSmithy.Type.describe(
+                input.type,
+                operation_name <> Naming.shape_name(input.name),
+                manifest
+              ),
+            description: input.description
+          }
+        end
 
+      %{
+        member
+        | required?: input.required?,
+          traits: default_traits(resource, action, input, attribute?, member.descriptor)
+      }
+    end)
+  end
+
+  # Default values aren't part of the manifest, only whether there is one.
+  defp default_traits(_resource, _action, %{has_default?: false}, _attribute?, _descriptor),
+    do: %{}
+
+  defp default_traits(resource, action, input, attribute?, descriptor) do
+    field =
+      cond do
         # Attribute defaults only apply on create
-        default = if action.type == :create, do: attribute.default
-
-        %{
-          member
-          | required?: attribute_required?(action, attribute),
-            traits: default_traits(attribute, member.descriptor, default)
-        }
-      end)
-
-    arguments =
-      action.arguments
-      |> Enum.filter(&Map.get(&1, :public?, true))
-      |> Enum.map(fn argument ->
-        descriptor =
-          AshSmithy.Type.describe(
-            argument.type,
-            argument.constraints,
-            operation_name <> Naming.shape_name(argument.name)
-          )
+        attribute? and action.type == :create ->
+          Ash.Resource.Info.attribute(resource, input.name)
 
         # Smithy discourages defaults in update inputs, since they look like partial updates
-        default = if action.type != :update, do: argument.default
+        attribute? or action.type == :update ->
+          nil
 
-        %Member{
-          name: argument.name,
-          member: AshSmithy.Resource.Info.member_name(resource, argument.name),
-          descriptor: descriptor,
-          description: argument.description,
-          required?: argument.allow_nil? == false and is_nil(argument.default),
-          traits: default_traits(argument, descriptor, default)
-        }
-      end)
+        true ->
+          resource
+          |> Ash.Resource.Info.action(action.name)
+          |> Map.get(:arguments, [])
+          |> Enum.find(&(&1.name == input.name))
+      end
 
-    attributes ++ arguments
-  end
-
-  defp default_traits(field, descriptor, default) do
-    case AshSmithy.Type.default_value(field.type, field.constraints, descriptor, default) do
-      {:ok, value} -> %{"smithy.api#default" => value}
-      :error -> %{}
+    with %{} <- field,
+         {:ok, value} <-
+           AshSmithy.Type.default_value(field.type, field.constraints, descriptor, field.default) do
+      %{"smithy.api#default" => value}
+    else
+      _ -> %{}
     end
-  end
-
-  defp attribute_required?(%{type: :create} = action, attribute) do
-    attribute.name in List.wrap(Map.get(action, :require_attributes)) or
-      (attribute.allow_nil? == false and is_nil(attribute.default) and not attribute.generated? and
-         attribute.name not in List.wrap(Map.get(action, :allow_nil_input)))
-  end
-
-  defp attribute_required?(action, attribute) do
-    attribute.name in List.wrap(Map.get(action, :require_attributes))
   end
 
   defp string_bindable?({:simple, type, _}) when type != "Document", do: true

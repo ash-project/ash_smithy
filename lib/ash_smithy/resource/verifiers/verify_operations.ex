@@ -138,6 +138,15 @@ defmodule AshSmithy.Resource.Verifiers.VerifyOperations do
                "but #{inspect(operation.action)} is a #{inspect(action.type)} action"
          )}
 
+      Map.get(action, :public?, true) == false ->
+        {:error,
+         DslError.exception(
+           module: resource,
+           path: path,
+           message:
+             "Action #{inspect(operation.action)} is not public. Only public actions can be exposed over Smithy."
+         )}
+
       operation.kind == :list and operation.paginated? and
           !(action.pagination && (action.pagination.keyset? || action.pagination.offset?)) ->
         {:error,

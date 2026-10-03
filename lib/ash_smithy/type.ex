@@ -1,6 +1,6 @@
 defmodule AshSmithy.Type do
   @moduledoc """
-  Maps Ash types to Smithy type descriptors.
+  Maps the types of an `Ash.Info.Manifest` to Smithy type descriptors.
 
   A descriptor is an intermediate representation used both to emit Smithy shapes and to
   encode/decode values on the wire, so that the model and the server can never disagree.
@@ -50,97 +50,84 @@ defmodule AshSmithy.Type do
   @timestamp_traits %{"smithy.api#timestampFormat" => "date-time"}
 
   @doc """
-  Returns the descriptor for an Ash type.
+  Returns the descriptor for a type from an `Ash.Info.Manifest`.
 
   `name` is used to name any shapes that must be generated for the type, e.g. an enum for an
-  atom attribute with `one_of` constraints.
+  atom attribute with `one_of` constraints. `manifest` is used to resolve named types.
   """
-  @spec describe(Ash.Type.t(), Keyword.t(), String.t()) :: descriptor
-  def describe(type, constraints, name) do
-    type = Ash.Type.get_type(type)
-    constraints = constraints || []
+  @spec describe(Ash.Info.Manifest.Type.t(), String.t(), AshSmithy.Manifest.t()) :: descriptor
+  def describe(%Ash.Info.Manifest.Type{} = type, name, manifest) do
+    constraints = type.constraints || []
 
     cond do
-      match?({:array, _}, type) ->
-        {:array, item_type} = type
-        item_constraints = constraints[:items] || []
+      custom_type?(type.module) ->
+        type.module.smithy_type(constraints)
 
-        {:list, name <> "List", describe(item_type, item_constraints, name <> "Item"),
-         constraints[:nil_items?] == true}
-
-      is_atom(type) and Code.ensure_loaded?(type) and function_exported?(type, :smithy_type, 1) ->
-        type.smithy_type(constraints)
-
-      Ash.Type.embedded_type?(type) ->
-        {:resource, type}
-
-      Spark.implements_behaviour?(type, Ash.Type.Enum) ->
-        enum(type_name(type), type.values())
-
-      Ash.Type.NewType.new_type?(type) ->
-        describe(
-          Ash.Type.NewType.subtype_of(type),
-          Ash.Type.NewType.constraints(type, constraints),
-          type_name(type)
-        )
+      type.kind == :type_ref ->
+        describe_named(AshSmithy.Manifest.resolve(manifest, type), manifest)
 
       true ->
-        describe_builtin(type, constraints, name)
+        describe_kind(type, constraints, name, manifest)
     end
   end
 
-  defp describe_builtin(type, constraints, name) do
-    case type do
-      type when type in [Ash.Type.String, Ash.Type.CiString] ->
+  defp custom_type?(module) do
+    is_atom(module) and not is_nil(module) and Code.ensure_loaded?(module) and
+      function_exported?(module, :smithy_type, 1)
+  end
+
+  # Named types (enums, new types and embedded resources) are named after their module
+  defp describe_named(%{kind: :embedded_resource, module: module}, _manifest),
+    do: {:resource, module}
+
+  defp describe_named(type, manifest), do: describe(type, type_name(type.module), manifest)
+
+  defp describe_kind(type, constraints, name, manifest) do
+    case type.kind do
+      :array ->
+        {:list, name <> "List", describe(type.item_type, name <> "Item", manifest),
+         constraints[:nil_items?] == true}
+
+      kind when kind in [:string, :ci_string] ->
         {:simple, "String", string_traits(constraints)}
 
-      Ash.Type.Atom ->
-        case constraints[:one_of] do
-          values when is_list(values) and values != [] -> enum(name, values)
-          _ -> {:simple, "String", %{}}
-        end
+      :enum ->
+        enum(
+          if(type.module == Ash.Type.Atom, do: name, else: type_name(type.module)),
+          type.values
+        )
 
-      type when type in [Ash.Type.UUID, Ash.Type.UUIDv7] ->
+      kind when kind in [:atom, :uuid, :date, :time, :time_usec, :duration] ->
         {:simple, "String", %{}}
 
-      Ash.Type.Integer ->
+      :integer ->
         {:simple, "Long", range_traits(constraints)}
 
-      Ash.Type.Float ->
+      :float ->
         {:simple, "Double", range_traits(constraints)}
 
-      Ash.Type.Decimal ->
+      :decimal ->
         {:simple, "BigDecimal", range_traits(constraints)}
 
-      Ash.Type.Boolean ->
+      :boolean ->
         {:simple, "Boolean", %{}}
 
-      Ash.Type.Binary ->
+      :binary ->
         {:simple, "Blob", %{}}
 
-      type
-      when type in [
-             Ash.Type.UtcDatetime,
-             Ash.Type.UtcDatetimeUsec,
-             Ash.Type.DateTime,
-             Ash.Type.NaiveDatetime
-           ] ->
+      kind when kind in [:datetime, :utc_datetime, :utc_datetime_usec, :naive_datetime] ->
         {:simple, "Timestamp", @timestamp_traits}
 
-      type when type in [Ash.Type.Date, Ash.Type.Time, Ash.Type.TimeUsec, Ash.Type.Duration] ->
-        {:simple, "String", %{}}
+      kind when kind in [:resource, :embedded_resource] ->
+        {:resource, type.resource_module || type.instance_of || type.module}
 
-      type when type in [Ash.Type.Map, Ash.Type.Keyword, Ash.Type.Struct] ->
+      kind when kind in [:map, :struct, :keyword] ->
         cond do
-          type == Ash.Type.Struct && constraints[:instance_of] &&
-              Ash.Resource.Info.resource?(constraints[:instance_of]) ->
-            {:resource, constraints[:instance_of]}
-
-          constraints[:fields] ->
-            {:structure, name, fields_members(constraints[:fields], name)}
+          type.fields ->
+            {:structure, name, fields_members(type.fields, name, manifest)}
 
           # Keyword lists can't be round tripped through JSON objects without fields
-          type == Ash.Type.Keyword ->
+          kind == :keyword ->
             {:simple, "Document", %{}}
 
           # Ash only accepts objects for maps, so this is more precise than a bare document
@@ -148,25 +135,17 @@ defmodule AshSmithy.Type do
             {:map, name, {:simple, "String", %{}}, {:simple, "Document", %{}}, false}
         end
 
-      Ash.Type.Union ->
-        members =
-          constraints
-          |> Keyword.get(:types, [])
-          |> Enum.map(fn {type_name, config} ->
-            %Member{
-              name: type_name,
-              member: AshSmithy.Naming.member_name(type_name),
-              descriptor:
-                describe(
-                  config[:type],
-                  config[:constraints] || [],
-                  name <> AshSmithy.Naming.shape_name(type_name)
-                ),
-              description: config[:description]
-            }
-          end)
-
-        {:union, name, members}
+      :union ->
+        {:union, name,
+         Enum.map(type.members || [], fn member ->
+           %Member{
+             name: member.name,
+             member: AshSmithy.Naming.member_name(member.name),
+             descriptor:
+               describe(member.type, name <> AshSmithy.Naming.shape_name(member.name), manifest),
+             description: member[:description]
+           }
+         end)}
 
       _ ->
         {:simple, "Document", %{}}
@@ -182,9 +161,11 @@ defmodule AshSmithy.Type do
   def identifier_descriptor({:enum, _, _} = descriptor), do: descriptor
   def identifier_descriptor(_), do: {:simple, "String", %{}}
 
-  @doc "The descriptor for a resource's structure shape."
+  @doc "The descriptor for a resource's structure shape, built from its manifest."
   @spec resource_structure(Ash.Resource.t()) :: descriptor
   def resource_structure(resource) do
+    manifest = AshSmithy.Manifest.for_resource(resource)
+    definition = manifest.resource
     name = resource_name(resource)
 
     identifiers =
@@ -196,12 +177,12 @@ defmodule AshSmithy.Type do
 
     members =
       resource
-      |> resource_fields()
+      |> resource_fields(definition)
       |> Enum.map(fn field_name ->
-        field = Ash.Resource.Info.field(resource, field_name)
+        field = Ash.Info.Manifest.Resource.get_field(definition, field_name)
 
         descriptor =
-          describe(field.type, field.constraints, name <> AshSmithy.Naming.shape_name(field.name))
+          describe(field.type, name <> AshSmithy.Naming.shape_name(field.name), manifest)
 
         if field.name in identifiers do
           %Member{
@@ -221,10 +202,10 @@ defmodule AshSmithy.Type do
             member: resource_member_name(resource, field.name),
             descriptor: descriptor,
             description: field.description,
-            required?: Map.get(field, :allow_nil?, true) == false,
+            required?: field.allow_nil? == false,
             # Calculations and aggregates are derived, so they are not properties of the resource
             traits:
-              if Ash.Resource.Info.attribute(resource, field.name) do
+              if field.kind == :attribute do
                 %{}
               else
                 %{"smithy.api#notProperty" => %{}}
@@ -233,15 +214,16 @@ defmodule AshSmithy.Type do
         end
       end)
 
-    {:structure, name, members ++ relationship_members(resource)}
+    {:structure, name, members ++ relationship_members(resource, definition)}
   end
 
   # Exposed relationships are optional members, only present when included.
-  defp relationship_members(resource) do
+  defp relationship_members(resource, definition) do
     if AshSmithy.Resource.Info.smithy_resource?(resource) do
       resource
-      |> AshSmithy.Resource.Info.relationships()
-      |> Enum.map(fn relationship ->
+      |> AshSmithy.Resource.Info.smithy_relationships!()
+      |> Enum.map(fn relationship_name ->
+        relationship = Ash.Info.Manifest.Resource.get_relationship(definition, relationship_name)
         destination = {:resource, relationship.destination}
 
         descriptor =
@@ -321,11 +303,11 @@ defmodule AshSmithy.Type do
     end
   end
 
-  defp resource_fields(resource) do
+  defp resource_fields(resource, definition) do
     if AshSmithy.Resource.Info.smithy_resource?(resource) do
       AshSmithy.Resource.Info.fields(resource)
     else
-      resource |> Ash.Resource.Info.public_attributes() |> Enum.map(& &1.name)
+      definition |> Ash.Info.Manifest.Resource.fields_by_kind(:attribute) |> Enum.map(& &1.name)
     end
   end
 
@@ -337,19 +319,15 @@ defmodule AshSmithy.Type do
     end
   end
 
-  defp fields_members(fields, name) do
-    Enum.map(fields, fn {field_name, config} ->
+  defp fields_members(fields, name, manifest) do
+    Enum.map(fields, fn field ->
       %Member{
-        name: field_name,
-        member: AshSmithy.Naming.member_name(field_name),
+        name: field.name,
+        member: AshSmithy.Naming.member_name(field.name),
         descriptor:
-          describe(
-            config[:type],
-            config[:constraints] || [],
-            name <> AshSmithy.Naming.shape_name(field_name)
-          ),
-        description: config[:description],
-        required?: config[:allow_nil?] == false
+          describe(field.type, name <> AshSmithy.Naming.shape_name(field.name), manifest),
+        description: field[:description],
+        required?: field[:allow_nil?] == false
       }
     end)
   end

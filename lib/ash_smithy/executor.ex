@@ -226,7 +226,10 @@ defmodule AshSmithy.Executor do
       |> Enum.uniq()
       |> Enum.map(fn member ->
         relationship =
-          Ash.Resource.Info.relationship(operation.resource, include_meta(operation)[member])
+          Ash.Info.Manifest.Resource.get_relationship(
+            AshSmithy.Manifest.for_resource(operation.resource).resource,
+            include_meta(operation)[member]
+          )
 
         {relationship.name, loads(relationship.destination)}
       end)
@@ -235,13 +238,18 @@ defmodule AshSmithy.Executor do
   end
 
   defp loads(resource) do
+    definition = AshSmithy.Manifest.for_resource(resource).resource
+
     resource
     |> AshSmithy.Type.resource_structure()
     |> elem(2)
-    |> Enum.map(& &1.name)
-    |> Enum.filter(fn name ->
-      Ash.Resource.Info.calculation(resource, name) || Ash.Resource.Info.aggregate(resource, name)
+    |> Enum.filter(fn member ->
+      match?(
+        %{kind: kind} when kind in [:calculation, :aggregate],
+        Ash.Info.Manifest.Resource.get_field(definition, member.name)
+      )
     end)
+    |> Enum.map(& &1.name)
   end
 
   defp include_meta(operation) do
